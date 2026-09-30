@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice Assistant</title>
+<style>
+  body{font-family:system-ui,sans-serif;max-width:640px;margin:2rem auto;padding:0 1rem;background:#0d1117;color:#e6edf3}
+  input,button{font:inherit;padding:.6rem .8rem;border-radius:8px;border:1px solid #30363d;background:#161b22;color:inherit}
+  button{cursor:pointer;background:#238636;border-color:#238636}
+  button.link{background:none;border:none;color:#58a6ff;padding:.2rem}
+  button.rec{background:#da3633;border-color:#da3633}
+  #log{min-height:260px;border:1px solid #30363d;border-radius:8px;padding:1rem;margin:1rem 0;overflow-y:auto;max-height:50vh}
+  .you{color:#58a6ff;margin:.5rem 0}.bot{color:#3fb950;margin:.5rem 0}.err{color:#f85149}.ok{color:#3fb950}
+  .row{display:flex;gap:.5rem;margin:.5rem 0;flex-wrap:wrap}.row input{flex:1;min-width:140px}
+  #staff{margin-top:1.5rem;padding-top:1rem;border-top:1px solid #30363d;display:none}
+</style>
+</head>
+<body>
+<h2>Voice Assistant</h2>
+
+<div id="login">
+  <div class="row"><input id="u" placeholder="Username" autocomplete="username">
+    <input id="p" type="password" placeholder="Password" autocomplete="current-password"></div>
+  <div class="row" id="invite-row" style="display:none"><input id="inv" placeholder="Invite code (if you were given one)"></div>
+  <button id="go" onclick="login()">Sign in</button>
+  <button class="link" id="toggle" onclick="toggleMode()">Create an account</button>
+  <div id="lerr" class="err"></div>
+</div>
+
+<div id="app" style="display:none">
+  <div id="log"></div>
+  <div class="row">
+    <input id="msg" placeholder="Type a message..." onkeydown="if(event.key==='Enter')sendText()">
+    <button onclick="sendText()">Send</button>
+    <button id="mic" onclick="toggleMic()">Talk</button>
+  </div>
+  <label><input type="checkbox" id="speak" checked> Speak replies</label>
+
+  <div id="staff">
+    <h3>Knowledge base (staff)</h3>
+    <div class="row"><input id="doc" type="file" accept="application/pdf"><button onclick="uploadDoc()">Upload PDF</button></div>
+    <div id="docmsg"></div>
+  </div>
+</div>
+
+<script>
+let token = null;            // kept in memory only (not localStorage)
+let registering = false;
+let recorder = null, chunks = [];
+const $ = id => document.getElementById(id);
+const log = $('log');
+
+function add(cls, text){
+  const d = document.createElement('div'); d.className = cls; d.textContent = text;
+  log.appendChild(d); log.scrollTop = log.scrollHeight;
+}
+const authHeaders = extra => Object.assign({Authorization: 'Bearer ' + token}, extra || {});
+
+function toggleMode(){
+  registering = !registering;
+  $('go').textContent = registering ? 'Create account' : 'Sign in';
+  $('toggle').textContent = registering ? 'I already have an account' : 'Create an account';
+  $('invite-row').style.display = registering ? 'flex' : 'none';
+  $('lerr').textContent = '';
+}
+
+async function login(){
+  $('lerr').textContent = '';
+  const username = $('u').value.trim(), password = $('p').value;
+  if(registering){
+    const r = await fetch('/api/auth/register/', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({username, password, invite_code: $('inv').value})});
+    const d = await r.json();
+    if(!r.ok){ $('lerr').textContent = d.error || 'Could not create the account'; return; }
+  }
+  const r = await fetch('/api/token/', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({username, password})});
+  if(!r.ok){ $('lerr').textContent = r.status === 429 ? 'Too many attempts. Wait a minute.' : 'Wrong username or password'; return; }
+  token = (await r.json()).access;
+  $('p').value = '';
+  $('login').style.display = 'none'; $('app').style.display = 'block';
+  const me = await (await fetch('/api/auth/me/', {headers: authHeaders()})).json();
+  if(me.is_staff) $('staff').style.display = 'block';
+  add('bot', 'Assistant: Hi ' + me.username + '! I can book appointments, open tickets, check your bookings and answer questions.');
+}
+
+function sessionExpired(){
+  token = null; $('app').style.display = 'none'; $('login').style.display = 'block';
+  $('lerr').textContent = 'Your session expired. Please sign in again.';
+}
+
+async function sendText(){
+  const text = $('msg').value.trim(); if(!text) return;
+  $('msg').value = ''; add('you', 'You: ' + text);
+  const r = await fetch('/api/agent/chat/', {method:'POST',
+    headers: authHeaders({'Content-Type':'application/json'}), body: JSON.stringify({text})});
+  handle(await r.json().catch(() => ({})), r);
+}
+
+async function toggleMic(){
+  if(recorder && recorder.state === 'recording'){ recorder.stop(); return; }
+  let stream;
+  try { stream = await navigator.mediaDevices.getUserMedia({audio:true}); }
+  catch(e){ add('err', 'Microphone blocked. Allow the mic in your browser (HTTPS is required).'); return; }
+  chunks = []; recorder = new MediaRecorder(stream);
+  recorder.ondataavailable = e => chunks.push(e.data);
+  recorder.onstop = async () => {
+    stream.getTracks().forEach(t => t.stop());
+    $('mic').classList.remove('rec'); $('mic').textContent = 'Talk';
+    const type = (recorder.mimeType || 'audio/webm').split(';')[0];
+    const fd = new FormData();
+    fd.append('audio', new Blob(chunks, {type}), 'speech');
+    const r = await fetch('/api/voice/', {method:'POST', headers: authHeaders(), body: fd});
+    const data = await r.json().catch(() => ({}));
+    if(data.transcript) add('you', 'You: ' + data.transcript);
+    handle(data, r);
+  };
+  recorder.start(); $('mic').classList.add('rec'); $('mic').textContent = 'Stop';
+}
+
+function handle(data, r){
+  if(r.status === 401){ sessionExpired(); return; }
+  if(!r.ok){ add('err', data.error || 'Error'); return; }
+  add('bot', 'Assistant: ' + data.reply);
+  if($('speak').checked) speakText(data.reply);
+}
+
+async function speakText(text){
+  try {                                   // 1) try ElevenLabs through our server
+    const r = await fetch('/api/voice/speak/', {method:'POST',
+      headers: authHeaders({'Content-Type':'application/json'}), body: JSON.stringify({text})});
+    if(r.ok){ new Audio(URL.createObjectURL(await r.blob())).play(); return; }
+  } catch(e) {}
+  const u = new SpeechSynthesisUtterance(text);   // 2) free browser voice
+  speechSynthesis.cancel(); speechSynthesis.speak(u);
+}
+
+async function uploadDoc(){
+  const f = $('doc').files[0]; if(!f) return;
+  $('docmsg').className = ''; $('docmsg').textContent = 'Uploading and indexing...';
+  const fd = new FormData(); fd.append('file', f);
+  const r = await fetch('/api/documents/', {method:'POST', headers: authHeaders(), body: fd});
+  const d = await r.json().catch(() => ({}));
+  $('docmsg').className = r.ok ? 'ok' : 'err';
+  $('docmsg').textContent = r.ok ? `Indexed "${d.title}" (${d.pages} pages, ${d.chunks} chunks).` : (d.error || 'Upload failed');
+}
+</script>
+</body>
+</html>

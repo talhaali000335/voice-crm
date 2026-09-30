@@ -1,0 +1,55 @@
+name: Deploy to AWS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+permissions:
+  id-token: write   # lets the job assume the AWS role through OIDC
+  contents: read
+
+env:
+  APP_NAME: voice-crm    # must match the AppName parameter of the CloudFormation stack
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      # The Docker image is built here on GitHub's servers and pushed to ECR. Nothing runs locally.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ env.APP_NAME }}:latest
+            ${{ steps.ecr.outputs.registry }}/${{ env.APP_NAME }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The stack creates the service with 0 tasks (no image existed yet). This starts/refreshes it.
+      - name: Roll out the new image
+        run: |
+          aws ecs update-service --cluster "$APP_NAME" --service "$APP_NAME" \
+            --desired-count 1 --force-new-deployment > /dev/null
+          aws ecs wait services-stable --cluster "$APP_NAME" --services "$APP_NAME"

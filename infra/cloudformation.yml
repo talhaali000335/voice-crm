@@ -1,0 +1,425 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Voice CRM agent: ECR, ECS Fargate, ALB, CloudFront (free HTTPS on *.cloudfront.net),
+  RDS Postgres (pgvector), ElastiCache Redis, Secrets Manager and a GitHub Actions deploy role.
+
+Parameters:
+  AppName:
+    Type: String
+    Default: voice-crm
+    AllowedPattern: '^[a-z][a-z0-9-]{2,20}$'
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Any VPC, e.g. your default VPC.
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: At least 2 PUBLIC subnets in different Availability Zones (tasks need internet access for Groq).
+  GitHubRepo:
+    Type: String
+    Description: 'owner/repo that is allowed to deploy, e.g. talha/voice-crm'
+    AllowedPattern: '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+  CreateGitHubOidcProvider:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Choose false if this AWS account already has the token.actions.githubusercontent.com OIDC provider.
+  GroqApiKey:
+    Type: String
+    NoEcho: true
+    MinLength: 10
+  AdminUsername:
+    Type: String
+    Default: admin
+  AdminPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 12
+    Description: First superuser (created on first start if it does not exist). Avoid quotes and backslashes.
+  ElevenLabsApiKey:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: Optional. Empty = the browser's built-in voice is used.
+  ElevenLabsVoiceId:
+    Type: String
+    Default: ''
+  MetricsToken:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: Optional. Empty = /health/metrics/ is disabled.
+  TimeZone:
+    Type: String
+    Default: UTC
+    Description: Business time zone, e.g. Europe/London or Asia/Karachi.
+  DbInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+  DbEngineVersion:
+    Type: String
+    Default: ''
+    Description: Optional Postgres version. Empty = RDS picks its current default (recommended; old versions get retired).
+  CacheNodeType:
+    Type: String
+    Default: cache.t4g.micro
+  DesiredCount:
+    Type: String
+    Default: '0'
+    AllowedValues: ['0', '1']
+    Description: Keep 0 for the first create (there is no image yet). After the first successful deploy, update the stack with 1.
+  TaskCpu:
+    Type: String
+    Default: '1024'
+  TaskMemory:
+    Type: String
+    Default: '2048'
+
+Conditions:
+  CreateOidc: !Equals [!Ref CreateGitHubOidcProvider, 'true']
+  HasDbVersion: !Not [!Equals [!Ref DbEngineVersion, '']]
+
+Resources:
+  # ── logs + image registry ────────────────────────
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${AppName}
+      RetentionInDays: 30
+
+  Repository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref AppName
+      EmptyOnDelete: true
+      ImageScanningConfiguration: {ScanOnPush: true}
+      LifecyclePolicy:
+        LifecyclePolicyText: >
+          {"rules":[{"rulePriority":1,"description":"keep last 10 images","selection":{"tagStatus":"any",
+          "countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}
+
+  # ── secrets ──────────────────────────────────────
+  AppSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub ${AppName} application secrets
+      GenerateSecretString:
+        SecretStringTemplate: !Sub >-
+          {"GROQ_API_KEY":"${GroqApiKey}","ADMIN_PASSWORD":"${AdminPassword}",
+          "ELEVENLABS_API_KEY":"${ElevenLabsApiKey}","ELEVENLABS_VOICE_ID":"${ElevenLabsVoiceId}",
+          "METRICS_TOKEN":"${MetricsToken}"}
+        GenerateStringKey: DJANGO_SECRET_KEY
+        PasswordLength: 60
+        ExcludePunctuation: true
+
+  OriginSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Shared header value proving a request came through CloudFront
+      GenerateSecretString:
+        PasswordLength: 40
+        ExcludePunctuation: true
+
+  # ── network security ─────────────────────────────
+  AlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Load balancer (HTTP from CloudFront; the listener rule checks a secret header)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0}
+
+  TaskSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Django containers
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 8000, ToPort: 8000, SourceSecurityGroupId: !Ref AlbSg}
+
+  DbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Postgres (only from containers)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref TaskSg}
+
+  CacheSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Redis (only from containers)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 6379, ToPort: 6379, SourceSecurityGroupId: !Ref TaskSg}
+
+  # ── database + cache ─────────────────────────────
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub ${AppName} database subnets
+      SubnetIds: !Ref SubnetIds
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Engine: postgres
+      EngineVersion: !If [HasDbVersion, !Ref DbEngineVersion, !Ref 'AWS::NoValue']
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: '20'
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: voice
+      MasterUsername: voiceadmin
+      ManageMasterUserPassword: true
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 7
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref DbSg]
+
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: !Sub ${AppName} cache subnets
+      SubnetIds: !Ref SubnetIds
+
+  Cache:
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      Engine: redis
+      CacheNodeType: !Ref CacheNodeType
+      NumCacheNodes: 1
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      VpcSecurityGroupIds: [!GetAtt CacheSg.GroupId]
+
+  # ── load balancer ────────────────────────────────
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      Subnets: !Ref SubnetIds
+      SecurityGroups: [!Ref AlbSg]
+      LoadBalancerAttributes:
+        - {Key: idle_timeout.timeout_seconds, Value: '60'}
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 8000
+      TargetType: ip
+      HealthCheckPath: /health/
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: {HttpCode: '200'}
+      TargetGroupAttributes:
+        - {Key: deregistration_delay.timeout_seconds, Value: '30'}
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:     # anyone reaching the ALB directly (not via CloudFront) gets a 403
+        - Type: fixed-response
+          FixedResponseConfig: {StatusCode: '403', ContentType: text/plain, MessageBody: Forbidden}
+
+  ListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref Listener
+      Priority: 1
+      Conditions:
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: X-Origin-Verify
+            Values: [!Sub '{{resolve:secretsmanager:${OriginSecret}:SecretString}}']
+      Actions:
+        - {Type: forward, TargetGroupArn: !Ref TargetGroup}
+
+  # ── CloudFront: free HTTPS (required for the microphone) without owning a domain ──
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub ${AppName}
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: alb
+            DomainName: !GetAtt LoadBalancer.DNSName
+            CustomOriginConfig:
+              OriginProtocolPolicy: http-only
+              HTTPPort: 80
+              OriginReadTimeout: 60
+            OriginCustomHeaders:
+              - HeaderName: X-Origin-Verify
+                HeaderValue: !Sub '{{resolve:secretsmanager:${OriginSecret}:SecretString}}'
+        DefaultCacheBehavior:
+          TargetOriginId: alb
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          Compress: true
+          CachePolicyId: 4135ea2d-6df8-48df-9e3e-3f5ab49f4d1d           # CachingDisabled
+          OriginRequestPolicyId: 33f36d7e-f396-46d9-90e0-52428a34d9dc   # AllViewerAndCloudFrontHeaders
+
+  # ── ECS ──────────────────────────────────────────
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref AppName
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - {Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: 'sts:AssumeRole'}
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: read-secrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: [!Ref AppSecret, !GetAtt Database.MasterUserSecret.SecretArn]
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref AppName
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      RuntimePlatform: {OperatingSystemFamily: LINUX, CpuArchitecture: X86_64}
+      ContainerDefinitions:
+        - Name: app
+          Image: !Sub ${Repository.RepositoryUri}:latest
+          Essential: true
+          PortMappings: [{ContainerPort: 8000}]
+          HealthCheck:
+            Command: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/', timeout=3)"]
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 120
+          Environment:
+            - {Name: DEBUG, Value: 'false'}
+            - {Name: DJANGO_ALLOWED_HOSTS, Value: !GetAtt Distribution.DomainName}
+            - {Name: CSRF_TRUSTED_ORIGINS, Value: !Sub 'https://${Distribution.DomainName}'}
+            - {Name: BEHIND_CLOUDFRONT, Value: 'true'}
+            - {Name: TRUSTED_PROXY_COUNT, Value: '2'}
+            - {Name: TIME_ZONE, Value: !Ref TimeZone}
+            - {Name: DB_HOST, Value: !GetAtt Database.Endpoint.Address}
+            - {Name: DB_PORT, Value: '5432'}
+            - {Name: DB_NAME, Value: voice}
+            - {Name: DB_USER, Value: voiceadmin}
+            - {Name: REDIS_URL, Value: !Sub 'redis://${Cache.RedisEndpoint.Address}:6379/0'}
+            - {Name: ADMIN_USERNAME, Value: !Ref AdminUsername}
+          Secrets:
+            - {Name: DJANGO_SECRET_KEY, ValueFrom: !Sub '${AppSecret}:DJANGO_SECRET_KEY::'}
+            - {Name: GROQ_API_KEY, ValueFrom: !Sub '${AppSecret}:GROQ_API_KEY::'}
+            - {Name: ADMIN_PASSWORD, ValueFrom: !Sub '${AppSecret}:ADMIN_PASSWORD::'}
+            - {Name: ELEVENLABS_API_KEY, ValueFrom: !Sub '${AppSecret}:ELEVENLABS_API_KEY::'}
+            - {Name: ELEVENLABS_VOICE_ID, ValueFrom: !Sub '${AppSecret}:ELEVENLABS_VOICE_ID::'}
+            - {Name: METRICS_TOKEN, ValueFrom: !Sub '${AppSecret}:METRICS_TOKEN::'}
+            - {Name: DB_PASSWORD, ValueFrom: !Sub '${Database.MasterUserSecret.SecretArn}:password::'}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: app
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: ListenerRule
+    Properties:
+      ServiceName: !Ref AppName
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount   # 0 on first create: no image exists yet
+      HealthCheckGracePeriodSeconds: 180
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: {Enable: true, Rollback: true}
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref SubnetIds
+          SecurityGroups: [!Ref TaskSg]
+      LoadBalancers:
+        - {ContainerName: app, ContainerPort: 8000, TargetGroupArn: !Ref TargetGroup}
+
+  # ── GitHub Actions deploy role (OIDC: no stored AWS keys) ──
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateOidc
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AppName}-github-deploy
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - CreateOidc
+                - !Ref GitHubOidcProvider
+                - !Sub arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals: {'token.actions.githubusercontent.com:aud': sts.amazonaws.com}
+              StringLike: {'token.actions.githubusercontent.com:sub': !Sub 'repo:${GitHubRepo}:ref:refs/heads/main'}
+      Policies:
+        - PolicyName: deploy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - {Effect: Allow, Action: ecr:GetAuthorizationToken, Resource: '*'}
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:CompleteLayerUpload
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !GetAtt Repository.Arn
+              - Effect: Allow
+                Action: [ecs:UpdateService, ecs:DescribeServices]
+                Resource: !Ref Service
+
+Outputs:
+  AppUrl:
+    Description: Open this (HTTPS) once the first deploy has finished
+    Value: !Sub https://${Distribution.DomainName}/
+  GitHubRoleArn:
+    Description: Save as the GitHub repository variable AWS_ROLE_ARN
+    Value: !GetAtt GitHubDeployRole.Arn
+  Region:
+    Description: Save as the GitHub repository variable AWS_REGION
+    Value: !Ref AWS::Region
+  EcrRepository:
+    Value: !GetAtt Repository.RepositoryUri
+  LogGroupName:
+    Value: !Ref LogGroup
