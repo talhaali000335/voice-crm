@@ -180,7 +180,7 @@ EMERGENCY_MESSAGE = (
 )
 
 # Model names change over time: override through env vars, no code change needed.
-LLM_MODELS = env_list("LLM_MODELS", "llama-3.3-70b-versatile,llama-3.1-8b-instant")   # tried in order
+LLM_MODELS = env_list("LLM_MODELS", "openai/gpt-oss-120b,openai/gpt-oss-20b")   # tried in order
 GROQ_API_KEY = env("GROQ_API_KEY")
 STT_MODEL = env("STT_MODEL", "whisper-large-v3-turbo")
 ELEVENLABS_API_KEY = env("ELEVENLABS_API_KEY")

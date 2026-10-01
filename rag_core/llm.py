@@ -23,9 +23,15 @@ def chat(prompt: str, *, system: str | None = None, temperature: float = 0.0, ma
     """Try each model in settings.LLM_MODELS until one answers."""
     messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]
     for model in settings.LLM_MODELS:
+        extra = {}
+        limit = max_tokens
+        if "gpt-oss" in model:
+            # Reasoning models spend part of the token budget on thinking, so keep it short and leave room.
+            extra["extra_body"] = {"reasoning_effort": "low"}
+            limit = max_tokens + 800
         try:
             r = _get_client().chat.completions.create(
-                model=model, messages=messages, temperature=temperature, max_tokens=max_tokens)
+                model=model, messages=messages, temperature=temperature, max_tokens=limit, **extra)
             return (r.choices[0].message.content or "").strip()
         except Exception as exc:
             logger.warning("LLM model %s failed: %s", model, type(exc).__name__)
