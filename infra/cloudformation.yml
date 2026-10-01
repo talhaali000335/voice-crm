@@ -175,7 +175,7 @@ Resources:
       ManageMasterUserPassword: true
       PubliclyAccessible: false
       MultiAZ: false
-      BackupRetentionPeriod: 7
+      BackupRetentionPeriod: 1
       DBSubnetGroupName: !Ref DbSubnetGroup
       VPCSecurityGroups: [!Ref DbSg]
 
